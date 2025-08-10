@@ -25,7 +25,7 @@ SPLIT="test"
 #NUM_TEST_SAMPLE=-1
 for seed in "${seeds[@]}"; do
   basename=${MODEL_NAME_OR_PATH##*/}
-  OUTPUT_DIR=math_eval_Seed${seed}_N${N_SAMPLING}_MAXTOKENS${MAX_TOKENS}_TOPP${TOP_P}_logits/${basename}
+  OUTPUT_DIR=math_eval_Seed${seed}_N${N_SAMPLING}_MAXTOKENS${MAX_TOKENS}_TOPP${TOP_P}_logits_annealed_s1.2_t0.1_d100/${basename}
   echo "OUTPUT_DIR: ${OUTPUT_DIR}"
   echo "MODEL_NAME_OR_PATH: ${MODEL_NAME_OR_PATH}"
   echo "SEED: ${seed}, TEMPERATURE: ${TEMPERATURE}, N_SAMPLING: ${N_SAMPLING}, MAX_TOKENS: ${MAX_TOKENS}"
@@ -110,6 +110,7 @@ for seed in "${seeds[@]}"; do
     --start 0 \
     --end -1 \
     --use_vllm \
+    --use_annealed_sampling \
     --save_outputs \
     --num_shots 5
 

@@ -58,9 +58,9 @@ def load_prompt(data_name, prompt_type, num_shots):
 
     if data_name in ["gsm_hard", "svamp", "tabmwp", "asdiv", "mawps"]:
         data_name = "gsm8k"
-    if data_name in ["math_oai", "hungarian_exam", "math-oai", "aime24", "amc23"]:
+    if data_name in ["math_oai", "hungarian_exam", "math-oai", "aime24", "amc23", "math-500"]:
         data_name = "math"
-    if data_name in ["sat_math"]:
+    if data_name in ["sat_math", "mmlu"]:
         data_name = "mmlu_stem"
     if data_name in [
         "gaokao2024_I",

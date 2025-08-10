@@ -1,4 +1,5 @@
 import random
+import pickle
 import os
 import argparse
 import time
@@ -16,6 +17,7 @@ from trajectory import *
 from data_loader import load_data
 from python_executor import PythonExecutor
 from model_utils import load_hf_lm_and_tokenizer, generate_completions
+from uncertainty_quantification.loglik_computation import get_tokenwise_entropy_from_vllm_outputs
 
 
 def parse_args():
@@ -39,6 +41,7 @@ def parse_args():
     parser.add_argument("--save_outputs", action="store_true")
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--use_safetensors", action="store_true")
+    parser.add_argument("--use_annealed_sampling", action="store_true",)
     parser.add_argument("--num_shots", type=int, default=0)
     parser.add_argument(
         "--apply_chat_template",
@@ -51,10 +54,15 @@ def parse_args():
         action="store_true",
         help="Few shot for multiple-choice questions, zero shot for others.",
     )
+    parser.add_argument("--ckpt_freq", type=int, default=-1, help="Checkpoint frequency for vllm outputs.")
+    parser.add_argument('--gpu_memory_utilization', type=float, default=0.7, help='(for vllm) gpu memory utilization.')
     args = parser.parse_args()
     args.top_p = (
         1 if args.temperature == 0 else args.top_p
     )  # top_p must be 1 when using greedy sampling (vllm)
+    if "deepseek" in args.model_name_or_path.lower() and args.n_sampling > 1:
+        if args.ckpt_freq == -1:
+            args.ckpt_freq = 64
     return args
 
 
@@ -63,8 +71,9 @@ def prepare_data(data_name, args):
 
     # sample `num_test_sample` from dataset
     if args.num_test_sample > 0:
-        # examples = random.sample(examples, min(args.num_test_sample, len(examples)))
-        examples = examples[: args.num_test_sample]
+        random.seed(args.seed)
+        examples = random.sample(examples, min(args.num_test_sample, len(examples)))
+        # examples = examples[: args.num_test_sample]
 
     # shuffle
     if args.shuffle:
@@ -77,7 +86,7 @@ def prepare_data(data_name, args):
     # get out_file name
     dt_string = datetime.now().strftime("%m-%d_%H-%M")
     model_name = "/".join(args.model_name_or_path.split("/")[-2:])
-    out_file_prefix = f"{args.split}_{args.prompt_type}_{args.num_test_sample}_seed{args.seed}_t{args.temperature}"
+    out_file_prefix = f"{args.split}_{args.prompt_type}_{args.num_test_sample}_seed{args.seed}_t{args.temperature}_{args.num_shots}shot"
     output_dir = args.output_dir
     if not os.path.exists(output_dir):
         output_dir = f"outputs/{output_dir}"
@@ -104,9 +113,7 @@ def prepare_data(data_name, args):
     examples = [example for example in examples if example["idx"] not in processed_idxs]
     return examples, processed_samples, out_file
 
-
-def setup(args):
-    # load model
+def setup_llm(args):
     available_gpus = os.environ["CUDA_VISIBLE_DEVICES"].split(",")
     if args.use_vllm:
         llm = LLM(
@@ -114,6 +121,8 @@ def setup(args):
             tensor_parallel_size=len(available_gpus) // args.pipeline_parallel_size,
             pipeline_parallel_size=args.pipeline_parallel_size,
             trust_remote_code=True,
+            gpu_memory_utilization=args.gpu_memory_utilization,
+            max_logprobs=100
         )
         tokenizer = None
         if args.apply_chat_template:
@@ -127,12 +136,92 @@ def setup(args):
             use_fast_tokenizer=True,
             use_safetensors=args.use_safetensors,
         )
+    return llm, tokenizer
+
+def create_stop_words(args):
+    stop_words = ["</s>", "<|im_end|>", "<|endoftext|>"]
+
+    if args.prompt_type in ["cot"]:
+        stop_words.append("\n\nQuestion:")
+    if args.prompt_type in ["pal", "tool-integrated", "jiuzhang_tora"]:
+        stop_words.extend(["\n\n---", "```output"])
+    elif args.prompt_type in ["wizard_zs", "platypus_fs"]:
+        stop_words.extend(["Instruction", "Response"])
+    elif "jiuzhang" in args.prompt_type:
+        stop_words.append("\n\n## Question")
+    elif "numina" in args.prompt_type:
+        stop_words.append("\n### Problem")
+    elif "pure" in args.prompt_type:
+        stop_words.append("\n\n\n")
+    return stop_words
+
+def annealed_sampling_processor(token_ids, logits, explore_temp=1.2, stability_temp=0.1, freq=100):
+    logits /= stability_temp + (explore_temp - stability_temp) * np.exp(-len(token_ids) / freq)
+    return logits
+
+def run_llm_via_vllm(args, llm, prompts, stop_words=None, checkpoint_filename=None):
+    if stop_words is None:
+        stop_words = create_stop_words(args)
+    logliks = []
+    token_ids_num = []
+    output_texts = []
+    entropies = []
+    start = 0
+    sampling_param = SamplingParams(
+        temperature=args.temperature,
+        top_p=args.top_p,
+        max_tokens=args.max_tokens_per_call,
+        logprobs=50,
+        n=1,
+        stop=stop_words,
+        stop_token_ids=(
+            [151645, 151643]
+            if "qwen2" in args.model_name_or_path.lower()
+            else None
+        ),
+        logits_processors=[annealed_sampling_processor] if args.use_annealed_sampling else None,
+    )
+    if os.path.exists(checkpoint_filename):
+        logliks, token_ids_num, output_texts, entropies = torch.load(checkpoint_filename)
+        start = len(output_texts)
+    if args.ckpt_freq > 0:
+        for j in range(start, len(prompts), args.ckpt_freq):
+            outputs = llm.generate(prompts[j: j + args.ckpt_freq], sampling_param)
+            inc_logliks, inc_token_ids_num, inc_output_texts, inc_entropies = postprocessing_vllm_outputs(outputs, args)
+            logliks.extend(inc_logliks)
+            token_ids_num.extend(inc_token_ids_num)
+            output_texts.extend(inc_output_texts)
+            entropies.extend(inc_entropies)
+            torch.save([logliks, token_ids_num, output_texts, entropies], checkpoint_filename)
+            print(f"Saved Checkpoints at {j} / {len(prompts)} to {checkpoint_filename}")
+    else:
+        outputs = llm.generate(
+            prompts[start:], sampling_param
+        )
+        inc_logliks, inc_token_ids_num, inc_output_texts, inc_entropies = postprocessing_vllm_outputs(outputs, args)
+        logliks.extend(inc_logliks)
+        token_ids_num.extend(inc_token_ids_num)
+        output_texts.extend(inc_output_texts)
+        entropies.extend(inc_entropies)
+    torch.save([logliks, token_ids_num, output_texts, entropies], checkpoint_filename)
+    print(f"LLM Generation Complete, Save Intermediate Results at {checkpoint_filename}")
+    outputs = output_texts
+    return logliks, token_ids_num, output_texts, entropies, outputs
+
+
+def setup(args):
+    # load model
 
     # infer & eval
     data_list = args.data_names.split(",")
+    # delay the loading of LLM until necessary
+    global llm
+    global tokenizer
+    llm, tokenizer = None, None
     results = []
     for data_name in data_list:
-        results.append(main(llm, tokenizer, data_name, args))
+        # results.append(main(llm, tokenizer, data_name, args))
+        results.append(main(data_name, args))
 
     # add "avg" result to data_list and results
     data_list.append("avg")
@@ -154,11 +243,35 @@ def is_multi_choice(answer):
             return False
     return True
 
+def postprocessing_vllm_outputs(vllm_outputs, args):
+    outputs = sorted(
+        vllm_outputs, key=lambda x: int(x.request_id)
+    )  # sort outputs by request_id
+    all_vllm_outputs = [output.outputs[0] for output in outputs]
+    logliks = [output.outputs[0].cumulative_logprob for output in outputs]
+    token_ids_num = [(len(output.prompt_token_ids), len(output.outputs[0].token_ids)) for output in outputs]
+    output_texts = [output.outputs[0].text for output in outputs]
+    entropies_w_token_ids = get_tokenwise_entropy_from_vllm_outputs(all_vllm_outputs, p=args.top_p, top_p_mode=True)
+    entropies = [x[0] for x in entropies_w_token_ids]
+    return logliks, token_ids_num, output_texts, entropies
 
-def main(llm, tokenizer, data_name, args):
+
+def main(data_name, args):
     examples, processed_samples, out_file = prepare_data(data_name, args)
+    output_metric_filename = out_file.replace(".jsonl", f"_{args.prompt_type}_metrics.json")
+    checkpoint_filename = out_file.replace(".jsonl", ".ckpt")
+    if not args.overwrite and len(examples) == 0 and os.path.exists(output_metric_filename):
+        # no remained samples, just ends
+        print(f"No remained examples and the user do not want to overwrite, report last time results for {data_name} wo llm initialization to save time")
+        results_json = json.load(open(output_metric_filename))
+        return results_json
+    else:
+        global llm, tokenizer
+        if llm is None:
+            llm, tokenizer = setup_llm(args)
+
     print("=" * 50)
-    print("data:", data_name, " ,remain samples:", len(examples))
+    print("data:", data_name, " , remain samples:", len(examples))
     if len(examples) > 0:
         print(examples[0])
 
@@ -231,20 +344,7 @@ def main(llm, tokenizer, data_name, args):
 
     max_func_call = 1 if args.prompt_type in ["cot", "pal"] else 4
 
-    stop_words = ["</s>", "<|im_end|>", "<|endoftext|>"]
-
-    if args.prompt_type in ["cot"]:
-        stop_words.append("\n\nQuestion:")
-    if args.prompt_type in ["pal", "tool-integrated", "jiuzhang_tora"]:
-        stop_words.extend(["\n\n---", "```output"])
-    elif args.prompt_type in ["wizard_zs", "platypus_fs"]:
-        stop_words.extend(["Instruction", "Response"])
-    elif "jiuzhang" in args.prompt_type:
-        stop_words.append("\n\n## Question")
-    elif "numina" in args.prompt_type:
-        stop_words.append("\n### Problem")
-    elif "pure" in args.prompt_type:
-        stop_words.append("\n\n\n")
+    stop_words = create_stop_words(args)
 
     # start inference
     # measure time use
@@ -258,26 +358,7 @@ def main(llm, tokenizer, data_name, args):
         # get all outputs
         prompts = [item[1] for item in current_prompts]
         if args.use_vllm:
-            outputs = llm.generate(
-                prompts,
-                SamplingParams(
-                    temperature=args.temperature,
-                    top_p=args.top_p,
-                    max_tokens=args.max_tokens_per_call,
-                    n=1,
-                    stop=stop_words,
-                    stop_token_ids=(
-                        [151645, 151643]
-                        if "qwen2" in args.model_name_or_path.lower()
-                        else None
-                    ),
-                ),
-            )
-
-            outputs = sorted(
-                outputs, key=lambda x: int(x.request_id)
-            )  # sort outputs by request_id
-            outputs = [output.outputs[0].text for output in outputs]
+            logliks, token_ids_num, output_texts, entropies, outputs = run_llm_via_vllm(args, llm, prompts, stop_words, checkpoint_filename)
         else:
             outputs = generate_completions(
                 model=llm,
@@ -355,6 +436,9 @@ def main(llm, tokenizer, data_name, args):
         result = results[i * args.n_sampling : (i + 1) * args.n_sampling]
         preds = [item[0] for item in result]
         reports = [item[1] for item in result]
+        loglik_piece = logliks[i * args.n_sampling : (i + 1) * args.n_sampling]
+        token_ids_num_piece = token_ids_num[i * args.n_sampling : (i + 1) * args.n_sampling]
+        entropies_piece = entropies[i * args.n_sampling: (i + 1) * args.n_sampling]
         for j in range(len(preds)):
             if sample["gt"] in ["A", "B", "C", "D", "E"] and preds[j] not in [
                 "A",
@@ -370,8 +454,8 @@ def main(llm, tokenizer, data_name, args):
                     [c for c in preds[j] if c in ["A", "B", "C", "D", "E"]]
                 )
 
-        sample.pop("prompt")
-        sample.update({"code": code, "pred": preds, "report": reports})
+        # sample.pop("prompt")
+        sample.update({"code": code, "pred": preds, "report": reports, "logliks": loglik_piece, "token_ids_num": token_ids_num_piece, "entropies": entropies_piece})
         all_samples.append(sample)
 
     # add processed samples
@@ -393,9 +477,10 @@ def main(llm, tokenizer, data_name, args):
     )
 
     with open(
-        out_file.replace(".jsonl", f"_{args.prompt_type}_metrics.json"), "w"
+        output_metric_filename, "w"
     ) as f:
         json.dump(result_json, f, indent=4)
+        # pickle.dump(result_json, f)
     return result_json
 
 

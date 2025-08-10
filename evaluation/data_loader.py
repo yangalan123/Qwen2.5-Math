@@ -18,6 +18,11 @@ def load_data(data_name, split, data_dir="./data"):
                 name="main",
                 cache_dir=f"{data_dir}/temp",
             )
+        elif data_name == "math-500":
+            dataset = load_dataset(
+                "HuggingFaceH4/MATH-500",
+                split=split,
+            )
         elif data_name == "gsm8k":
             dataset = load_dataset(data_name, split=split)
         elif data_name == "svamp":
@@ -40,31 +45,32 @@ def load_data(data_name, split, data_dir="./data"):
                     example["type"] = data_name
                 examples.extend(sub_examples)
             dataset = Dataset.from_list(examples)
-        elif data_name == "mmlu_stem":
+        elif data_name == "mmlu_stem" or data_name == "mmlu":
             dataset = load_dataset("hails/mmlu_no_train", "all", split="test")
-            # only keep stem subjects
-            stem_subjects = [
-                "abstract_algebra",
-                "astronomy",
-                "college_biology",
-                "college_chemistry",
-                "college_computer_science",
-                "college_mathematics",
-                "college_physics",
-                "computer_security",
-                "conceptual_physics",
-                "electrical_engineering",
-                "elementary_mathematics",
-                "high_school_biology",
-                "high_school_chemistry",
-                "high_school_computer_science",
-                "high_school_mathematics",
-                "high_school_physics",
-                "high_school_statistics",
-                "machine_learning",
-            ]
             dataset = dataset.rename_column("subject", "type")
-            dataset = dataset.filter(lambda x: x["type"] in stem_subjects)
+            if "stem" in data_name:
+                # only keep stem subjects
+                stem_subjects = [
+                    "abstract_algebra",
+                    "astronomy",
+                    "college_biology",
+                    "college_chemistry",
+                    "college_computer_science",
+                    "college_mathematics",
+                    "college_physics",
+                    "computer_security",
+                    "conceptual_physics",
+                    "electrical_engineering",
+                    "elementary_mathematics",
+                    "high_school_biology",
+                    "high_school_chemistry",
+                    "high_school_computer_science",
+                    "high_school_mathematics",
+                    "high_school_physics",
+                    "high_school_statistics",
+                    "machine_learning",
+                ]
+                dataset = dataset.filter(lambda x: x["type"] in stem_subjects)
         elif data_name == "carp_en":
             dataset = load_jsonl(f"{data_dir}/carp_en/test.jsonl")
         else:

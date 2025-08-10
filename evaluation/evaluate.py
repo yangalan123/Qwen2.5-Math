@@ -34,7 +34,7 @@ def evaluate(data_name, prompt_type, samples: list=None, file_path: str=None, ma
     timeout_cnt = 0 
 
     with ProcessPool(max_workers=1) as pool:
-        future = pool.map(math_equal_process, params, timeout=3)
+        future = pool.map(math_equal_process, params, timeout=30)
         iterator = future.result()
         with tqdm(total=len(samples), desc="Evaluate") as progress_bar:
             while True:
