@@ -17,8 +17,85 @@ from trajectory import *
 from data_loader import load_data
 from python_executor import PythonExecutor
 from model_utils import load_hf_lm_and_tokenizer, generate_completions
-from uncertainty_quantification.loglik_computation import get_tokenwise_entropy_from_vllm_outputs
+import numpy as np
+# from uncertainty_quantification.loglik_computation import get_tokenwise_entropy_from_vllm_outputs
+tolerance_inf = 1e-12
+def get_logprob_per_token_from_vllm_outputs(vllm_output_token):
+    # vllm updated implementation, for backward compatibility
+    if isinstance(vllm_output_token, float):
+        return vllm_output_token
+    else:
+        return vllm_output_token.logprob
 
+def get_truncated_dist_top_p(sorted_dist, top_p, tolerance_inf=tolerance_inf):
+    # 2025-01-10: this is a new implementation take numerical instability into consideration
+    # esp. for entropy contribution, when a logprob is sufficiently small, we can ignore it
+    _cumulative_probs = 0.0
+    truncated_dist = dict()
+    for key, value in sorted_dist:
+        _exp_logprob = np.exp(value)
+        if np.isinf(value) or _exp_logprob < tolerance_inf:
+            # too small to contribute meaningfully, so we can save some consideration for numerical stability
+            continue
+        _cumulative_probs += _exp_logprob
+        truncated_dist[key] = value
+        if _cumulative_probs >= top_p:
+            break
+    return truncated_dist
+def get_token_truncated_dist_from_vllm_outputs(unnormalized_dist, token_ids, length_i, p, top_p_mode=False):
+    if not top_p_mode:
+        # min_p mode
+        truncated_dist = dict()
+        for key in unnormalized_dist:
+            # if isinstance(unnormalized_dist[key], float):
+            #     _value = unnormalized_dist[key]
+            # else:
+            #     _value = unnormalized_dist[key].logprob
+            _value = get_logprob_per_token_from_vllm_outputs(unnormalized_dist[key])
+            if np.exp(_value) >= p or key == token_ids[length_i]:
+                # "or" part: allow minor error
+                # delay all normalization in the end to avoid numerical instability
+                # normalized_dist[key] = unnormalized_dist[key]
+                truncated_dist[key] = _value
+    else:
+        _unnormalized_dist = {key: get_logprob_per_token_from_vllm_outputs(unnormalized_dist[key]) for key in
+                              unnormalized_dist}
+        _sorted_dist = sorted(_unnormalized_dist.items(), key=lambda x: x[1], reverse=True)
+        # for key, value in _sorted_dist:
+        #     _cumulative_probs += np.exp(value)
+        #     normalized_dist[key] = value
+        #     if _cumulative_probs >= p:
+        #         break
+        truncated_dist = get_truncated_dist_top_p(_sorted_dist, p)
+        # "or" part: allow minor error
+        # delay all normalization in the end to avoid numerical instability
+        if token_ids[length_i] not in truncated_dist:
+            truncated_dist[token_ids[length_i]] = get_logprob_per_token_from_vllm_outputs(
+                unnormalized_dist[token_ids[length_i]])
+    keys = list(truncated_dist.keys())
+    assert token_ids[length_i] in keys, "Token not in the distribution: length-i:{}, token: {}, prob: {}".format(
+        length_i, token_ids[length_i], np.exp(unnormalized_dist[token_ids[length_i]].logprob))
+    values = [truncated_dist[key] for key in keys]
+    normalized_dist_values = torch.softmax(torch.tensor(values), dim=0)
+    return keys, normalized_dist_values
+
+def get_tokenwise_entropy_from_vllm_outputs(outputs, p, max_length=None, top_p_mode=False):
+    buf = []
+    for output in outputs:
+        _per_output_buf = []
+        gen_seq_len = len(output.logprobs)
+        token_ids = output.token_ids
+        _max_length = min(gen_seq_len, max_length) if max_length is not None else gen_seq_len
+        for length_i in range(_max_length):
+            unnormalized_dist = output.logprobs[length_i]
+            if unnormalized_dist is None:
+                break
+            keys, normalized_dist_values = get_token_truncated_dist_from_vllm_outputs(unnormalized_dist, token_ids,
+                                                                                      length_i, p, top_p_mode)
+            entropy = -torch.sum(normalized_dist_values * torch.log(normalized_dist_values))
+            _per_output_buf.append(entropy.item())
+        buf.append([_per_output_buf, token_ids])
+    return buf
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -42,6 +119,11 @@ def parse_args():
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--use_safetensors", action="store_true")
     parser.add_argument("--use_annealed_sampling", action="store_true",)
+    parser.add_argument("--annealed_sampling_decay_mode", type=str, default="negexp", choices=["global_step", "token_length", "both", "both_v_1_5", "negexp", "steps_variant", "steps_variant_rev", "none"])
+    parser.add_argument("--annealed_sampling_exploration_temp", type=float, default=1.2)
+    parser.add_argument("--annealed_sampling_stability_temp", type=float, default=0.1)
+    parser.add_argument("--annealed_sampling_decay_freq", type=int, default=25)
+    parser.add_argument("--annealed_sampling_warmup_period", type=int, default=10)
     parser.add_argument("--num_shots", type=int, default=0)
     parser.add_argument(
         "--apply_chat_template",
@@ -155,8 +237,67 @@ def create_stop_words(args):
         stop_words.append("\n\n\n")
     return stop_words
 
-def annealed_sampling_processor(token_ids, logits, explore_temp=1.2, stability_temp=0.1, freq=100):
-    logits /= stability_temp + (explore_temp - stability_temp) * np.exp(-len(token_ids) / freq)
+def annealed_sampling_processor(token_ids: Union[list[int], tuple[int]], logits: torch.Tensor, 
+                               exploration_temp: float = 1.0, stability_temp: float = 0.1, 
+                               decay_freq: int = 50, global_step: int = 0,
+                               decay_mode: str = 'both', warmup_period: int = 10) -> torch.Tensor:
+    """
+    Annealed sampling logits processor for vLLM.
+    
+    Args:
+        token_ids: List of token IDs generated so far
+        logits: Logits tensor from the model
+        exploration_temp: Exploration temperature (higher = more exploration)
+        stability_temp: Stability temperature (lower = more focused)
+        decay_freq: Decay frequency for temperature annealing
+        global_step: Current global optimization step
+        decay_mode: Which annealing mode to use. Options: 'global_step', 'token_length', 'both', 'none', 'adaptive'.
+        warmup_period: If len(token_ids) < warmup_period, do not apply temperature scaling (default: 10)
+        adaptive_decay: Whether to use adaptive decay based on historical performance
+        uid: Unique identifier for the current trajectory (required for adaptive decay)
+        historical_manager: Historical data manager instance (optional, will use global if None)
+    Returns:
+        Modified logits tensor
+    """
+    # If in warmup period, do not apply temperature scaling
+    if len(token_ids) < warmup_period:
+        return logits
+    
+    # Calculate the current temperature based on the selected decay mode
+    if decay_mode == 'global_step':
+        current_temp = stability_temp + (exploration_temp - stability_temp) * np.exp(-global_step / decay_freq)
+    elif decay_mode == 'token_length':
+        current_temp = stability_temp + (exploration_temp - stability_temp) * np.exp(-len(token_ids) / (20 * decay_freq))
+    elif decay_mode == 'both':
+        _exploration_temp = exploration_temp * np.exp(-global_step / decay_freq)
+        current_temp = stability_temp + (_exploration_temp - stability_temp) * np.exp(-len(token_ids) / (20 * decay_freq))
+    elif decay_mode == "both_v_1_5":
+        _decay_freq = min(decay_freq + 5 * global_step, 2000)
+        current_temp = stability_temp + (exploration_temp - stability_temp) * np.exp(-len(token_ids) / (20 * _decay_freq))
+    elif decay_mode == "negexp":
+        # as we use -exp(x/d), we need to use a larger decay_freq to get a smaller temperature and to keep the temperature >= 0
+        _decay_freq = min(decay_freq + 5 * global_step, 40000)
+        current_temp = 1 + exploration_temp - np.exp(len(token_ids) / (20 * _decay_freq))
+        # avoid temperature < stability_temp
+        current_temp = max(current_temp, stability_temp)
+    elif decay_mode == "steps_variant":
+        # use the same temperature at all positions, no matter how long token_ids is
+        # the temperature gradually increases from stability_temp to exploration_temp
+        current_temp = exploration_temp + (stability_temp - exploration_temp) * np.exp(-global_step / decay_freq)
+        current_temp = min(current_temp, 1.0)
+    elif decay_mode == "steps_variant_rev":
+        # use the same temperature at all positions, no matter how long token_ids is
+        # the temperature gradually increases from stability_temp to exploration_temp
+        current_temp = stability_temp + (exploration_temp - stability_temp) * np.exp(-global_step / decay_freq)
+        current_temp = max(current_temp, 0.1)
+    elif decay_mode == 'none':
+        current_temp = exploration_temp
+    else:
+        raise ValueError(f"Unknown decay_mode: {decay_mode}")
+
+    # Apply temperature scaling to logits
+    logits = logits / current_temp
+    
     return logits
 
 def run_llm_via_vllm(args, llm, prompts, stop_words=None, checkpoint_filename=None):
@@ -167,6 +308,16 @@ def run_llm_via_vllm(args, llm, prompts, stop_words=None, checkpoint_filename=No
     output_texts = []
     entropies = []
     start = 0
+    _annealed_sampling_processor = lambda token_ids, logits: annealed_sampling_processor(
+        token_ids, 
+        logits, 
+        exploration_temp=args.annealed_sampling_exploration_temp, 
+        stability_temp=args.annealed_sampling_stability_temp, 
+        decay_freq=args.annealed_sampling_decay_freq, 
+        global_step=args.annealed_sampling_global_step,
+        decay_mode=args.annealed_sampling_decay_mode, 
+        warmup_period=args.annealed_sampling_warmup_period
+    )
     sampling_param = SamplingParams(
         temperature=args.temperature,
         top_p=args.top_p,
@@ -179,7 +330,7 @@ def run_llm_via_vllm(args, llm, prompts, stop_words=None, checkpoint_filename=No
             if "qwen2" in args.model_name_or_path.lower()
             else None
         ),
-        logits_processors=[annealed_sampling_processor] if args.use_annealed_sampling else None,
+        logits_processors=[_annealed_sampling_processor] if args.use_annealed_sampling else None,
     )
     if os.path.exists(checkpoint_filename):
         logliks, token_ids_num, output_texts, entropies = torch.load(checkpoint_filename)
