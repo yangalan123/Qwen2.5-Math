@@ -5,8 +5,7 @@ cd latex2sympy
 pip install -e .
 cd ..
 pip install -r requirements.txt 
-pip install vllm==0.5.1 --no-build-isolation
-pip install transformers==4.42.3
+# as we already install vllm and transformer, the installation requirement should automatically be fulfilled. Though we cannot reproduce the exact same performance numbers in official qwen-verify, the results should be close
 ```
 
 ### Evaluation
