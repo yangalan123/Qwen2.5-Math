@@ -123,6 +123,7 @@ def parse_args():
     parser.add_argument("--annealed_sampling_exploration_temp", type=float, default=1.2)
     parser.add_argument("--annealed_sampling_stability_temp", type=float, default=0.1)
     parser.add_argument("--annealed_sampling_decay_freq", type=int, default=25)
+    parser.add_argument("--annealed_sampling_global_step", type=int, default=200)
     parser.add_argument("--annealed_sampling_warmup_period", type=int, default=10)
     parser.add_argument("--num_shots", type=int, default=0)
     parser.add_argument(
@@ -145,6 +146,12 @@ def parse_args():
     if "deepseek" in args.model_name_or_path.lower() and args.n_sampling > 1:
         if args.ckpt_freq == -1:
             args.ckpt_freq = 64
+    if "global_step_" in args.model_name_or_path:
+        # global_step_x is part of the path, use regex to get the global_step
+        try:
+            args.annealed_sampling_global_step = int(re.search(r"global_step_(\d+)", args.model_name_or_path).group(1))
+        except:
+            print(f"Warning: global_step_x is part of the path, but cannot find the global_step, use default value {args.annealed_sampling_global_step}")
     return args
 
 
