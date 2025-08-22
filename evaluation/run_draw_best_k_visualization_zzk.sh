@@ -17,8 +17,9 @@ experiment_name=""
 # This base_model_name is used for filename and plot title
 base_model_name=Llama-3.2-1B-Instruct
 ckpt_dir=checkpoints/${project_name}/${experiment_name}
+visualization_dir=visualization_best_at_k/${experiment_name}
 
 for global_step_dir in ${ckpt_dir}/global_step_*; do
     basename=$(basename ${global_step_dir})
-    python visualize_best_at_k.py --output_dir outputs/${experiment_name}/${basename} --visualization_dir ./rl_ckpts_evaluation/debug_visualization_two_curves --model_name $base_model_name
+    python visualize_best_at_k.py --output_dir outputs/${experiment_name}/${basename} --visualization_dir $visualization_dir/${basename}  --model_name $base_model_name
 done
