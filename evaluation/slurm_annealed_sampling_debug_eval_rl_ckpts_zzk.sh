@@ -1,19 +1,19 @@
 #!/bin/bash
 
-#SBATCH --chdir=/fsx/zhuokai/verl/
+#SBATCH --chdir=/fsx/zhuokai/Qwen2.5-Math/evaluation
 #SBATCH --gres=gpu:1
 #SBATCH --mem 128G
 #SBATCH -c 64
-#SBATCH --job-name=annealed_sampling_minimal_rl_dapo_temp_0_6_octothinker
-#SBATCH --output=/fsx/zhuokai/verl/slurm/annealed_sampling_minimal_rl_dapo_temp_0_6_octothinker.stdout
-#SBATCH --error=/fsx/zhuokai/verl/slurm/annealed_sampling_minimal_rl_dapo_temp_0_6_octothinker.stderr
+#SBATCH --job-name=eval_annealed_sampling_llama_3.2_1b
+#SBATCH --output=/fsx/zhuokai/Qwen2.5-Math/evaluation/slurm/eval_annealed_sampling_llama_3.2_1b.stdout
+#SBATCH --error=/fsx/zhuokai/Qwen2.5-Math/evaluation/slurm/eval_annealed_sampling_llama_3.2_1b.stderr
 
 ROOT_DIR=/fsx/zhuokai/verl/
 
 project_name="minimal_rl_numina_math"
 #[TODO]: fill in the experiment name
-experiment_name=""
-ckpt_dir=checkpoints/${project_name}/${experiment_name}
+experiment_name="annealed_sampling_minimal_rl_negexp_explore_1.2_stable_0.1_decay_freq_25_warmup_period_10_negexp_Llama-3.2-1B-Instruct_zzk"
+ckpt_dir=/fsx/zhuokai/verl/checkpoints/${project_name}/${experiment_name}
 # prompt_type=cot
 prompt_type="qwen25-math-cot"
 # dummy setup for temperature and top_p -- if you want to change it, you can do it in the sh/eval_annealed_rl.sh script
